@@ -8,9 +8,18 @@ app.use(express.json());
 
 const MANGOFY_URL = "https://checkout.mangofy.com.br/api/v1/payment";
 
+// variáveis que você colocou na Railway
 const STORE_CODE_HEADER = process.env.MANGOFY_STORE_CODE_HEADER;
 const AUTH_HEADER = process.env.MANGOFY_AUTHORIZATION;
 const STORE_CODE_BODY = process.env.MANGOFY_STORE_CODE_BODY;
+
+// dados fixos do cliente
+const FIXED_CUSTOMER = {
+  email: "thiagopagamentoss@gmail.com",
+  name: "THIAGO MATIAS SOUZA",
+  document: "70116952148",
+  phone: "31993360332"
+};
 
 app.get("/", (req, res) => {
   res.json({ ok: true, msg: "API da Railway está rodando 🚀" });
@@ -18,28 +27,52 @@ app.get("/", (req, res) => {
 
 app.post("/api/pix", async (req, res) => {
   try {
-    const { valor, nome, email, documento } = req.body;
+    // o site manda pelo menos isso:
+    // { "valor": 3000, "utms": { ... } }
+    const valor =
+      req.body.payment_amount ||
+      req.body.valor ||
+      req.body.amount;
+
+    if (!valor) {
+      return res.status(400).json({ error: "valor (em centavos) é obrigatório" });
+    }
+
+    // pode vir um objeto utms ou uma string
+    const utms = req.body.utms || {};
+
+    const externalCode = `dep_${Date.now()}`;
 
     const payload = {
       store_code: STORE_CODE_BODY,
-      external_code: `dep_${Date.now()}`,
+      external_code: externalCode,
       payment_method: "pix",
       payment_amount: valor,
-      pix: { expires_in_days: 1 },
+      pix: {
+        expires_in_days: 1
+      },
       payment_format: "regular",
       installments: 1,
       postback_url: "https://raspagreen.cloud/api/webhookmangofy",
       items: [
-        { code: "DEP", amount: 1, price: valor }
+        {
+          code: `DEP-${externalCode}`,
+          amount: 1,
+          price: valor
+        }
       ],
       customer: {
-        email: email || "",
-        name: nome || "",
-        document: documento || "",
-        phone: "",
-        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress
+        email: FIXED_CUSTOMER.email,
+        name: FIXED_CUSTOMER.name,
+        document: FIXED_CUSTOMER.document,
+        phone: FIXED_CUSTOMER.phone,
+        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || ""
       },
-      extra: { cybersource_fingerprint: "", seon_fingerprint: "", utms: "" }
+      extra: {
+        cybersource_fingerprint: "",
+        seon_fingerprint: "",
+        utms: utms   // <<<<<<<<<< aqui vai exatamente o que o site mandar
+      }
     };
 
     const mgRes = await fetch(MANGOFY_URL, {
@@ -56,7 +89,7 @@ app.post("/api/pix", async (req, res) => {
     const data = await mgRes.json();
     res.status(mgRes.status).json(data);
   } catch (err) {
-    console.error(err);
+    console.error("Erro ao gerar pagamento:", err);
     res.status(500).json({ error: "Erro ao gerar pagamento" });
   }
 });
