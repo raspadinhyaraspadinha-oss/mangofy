@@ -21,7 +21,7 @@ const POSTBACK_URL =
 
 // UTMify
 const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
-const UTMIFY_API_TOKEN = "ln4ADbicHelhM9oE23nylaKAedAkTEmD6n6R";
+const UTMIFY_API_TOKEN = "o3TW8mrJa7xcrr19toAWtKwWE3Hf57xyhGpk";
 
 // dados fixos do cliente
 const FIXED_CUSTOMER = {
