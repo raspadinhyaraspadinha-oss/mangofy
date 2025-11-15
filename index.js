@@ -6,22 +6,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ============ CONFIG GERAL ============ */
-
-// Criar pagamento
-const MANGOFY_CREATE_URL = "https://checkout.mangofy.com.br/api/v1/payment";
-// Consultar pagamento por código
-const MANGOFY_GET_BASE_URL = "https://checkout.mangofy.com.br/api/v1/payment";
-
+/* ============ CONFIGURAÇÕES ============ */
+const MANGOFY_URL = "https://checkout.mangofy.com.br/api/v1/payment";
 const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
 
-// ENV (configure na Railway → Variables)
+// VARIÁVEIS NA RAILWAY
 const STORE_CODE_HEADER = process.env.MANGOFY_STORE_CODE_HEADER;
 const AUTH_HEADER = process.env.MANGOFY_AUTHORIZATION;
 const STORE_CODE_BODY = process.env.MANGOFY_STORE_CODE_BODY;
-const UTMIFY_API_TOKEN = process.env.UTMIFY_API_TOKEN; // token da UTMify
+const UTMIFY_API_TOKEN = process.env.UTMIFY_API_TOKEN; // Adicione essa variável na Railway!
 
-// Dados fixos do cliente (como você definiu)
+// CLIENTE FIXO
 const FIXED_CUSTOMER = {
   name: "THIAGO MATIAS SOUZA",
   email: "thiagopagamentoss@gmail.com",
@@ -30,65 +25,17 @@ const FIXED_CUSTOMER = {
   country: "BR"
 };
 
-/* ============ HELPERS ============ */
-
-// Formata NOW em UTC no padrão 'YYYY-MM-DD HH:MM:SS'
-function nowUtcString() {
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mi = String(d.getUTCMinutes()).padStart(2, "0");
-  const ss = String(d.getUTCSeconds()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
-}
-
-// Monta objeto trackingParameters para UTMify
-function buildTrackingParameters(utms = {}) {
-  return {
-    src: utms.src || null,
-    sck: utms.sck || null,
-    utm_source: utms.utm_source || null,
-    utm_campaign: utms.utm_campaign || null,
-    utm_medium: utms.utm_medium || null,
-    utm_content: utms.utm_content || null,
-    utm_term: utms.utm_term || null
-  };
-}
-
-/* ============ UTMIFY ============ */
-
-async function sendToUtmify({
-  paymentCode,
-  status,           // "waiting_payment" ou "paid"
-  valor,            // em centavos
-  utms,
-  createdAtUtc,
-  approvedAtUtc = null
-}) {
-  const trackingParameters = buildTrackingParameters(utms);
-
-  // comissão: 3% pro gateway (ajuste se quiser outro valor)
-  const gatewayFee = Math.round(valor * 0.03) || 1;
-  const userCommission = valor - gatewayFee;
-
+/* ============ FUNÇÃO: ENVIAR PARA UTMIFY ============ */
+async function sendToUtmify({ paymentCode, status, valor, utms, createdAt, approvedAt = null }) {
   const body = {
     orderId: paymentCode,
-    platform: "RaspaGreen",            // nome da “plataforma” que aparece lá
+    platform: "RaspaGreen",
     paymentMethod: "pix",
-    status,                            // waiting_payment | paid
-    createdAt: createdAtUtc,           // UTC
-    approvedDate: approvedAtUtc,       // UTC ou null
+    status, // "waiting_payment" ou "paid"
+    createdAt,
+    approvedDate: approvedAt,
     refundedAt: null,
-    customer: {
-      name: FIXED_CUSTOMER.name,
-      email: FIXED_CUSTOMER.email,
-      phone: FIXED_CUSTOMER.phone,
-      document: FIXED_CUSTOMER.document,
-      country: FIXED_CUSTOMER.country,
-      // ip é opcional, podemos não enviar aqui
-    },
+    customer: FIXED_CUSTOMER,
     products: [
       {
         id: paymentCode,
@@ -99,48 +46,38 @@ async function sendToUtmify({
         priceInCents: valor
       }
     ],
-    trackingParameters,
+    trackingParameters: {
+      src: null,
+      sck: null,
+      utm_source: utms?.utm_source || null,
+      utm_campaign: utms?.utm_campaign || null,
+      utm_medium: utms?.utm_medium || null,
+      utm_content: utms?.utm_content || null,
+      utm_term: utms?.utm_term || null
+    },
     commission: {
       totalPriceInCents: valor,
-      gatewayFeeInCents: gatewayFee,
-      userCommissionInCents: userCommission
+      gatewayFeeInCents: Math.round(valor * 0.03), // Exemplo: 3%
+      userCommissionInCents: valor - Math.round(valor * 0.03)
     },
     isTest: false
   };
 
-  try {
-    const res = await fetch(UTMIFY_URL, {
-      method: "POST",
-      headers: {
-        "x-api-token": UTMIFY_API_TOKEN,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+  const res = await fetch(UTMIFY_URL, {
+    method: "POST",
+    headers: {
+      "x-api-token": UTMIFY_API_TOKEN,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
 
-    const text = await res.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
-
-    console.log(`[UTMIFY][${status}] status=${res.status} →`, data);
-  } catch (err) {
-    console.error(`[UTMIFY][${status}] ERRO:`, err);
-  }
+  const data = await res.json();
+  console.log(`[UTMIFY][${status}] →`, data);
 }
 
-/* ============ MONITORAR PIX ============ */
-
-async function monitorPixStatus(paymentCode, valor, utms, createdAtUtc) {
-  console.log(`[Monitor] Iniciando monitoramento de ${paymentCode}...`);
-
-  let attempts = 0;
-  const maxAttempts = 7;         // ~ 7 * 40s ≈ 4m40s
-  const intervalMs = 40000;      // 40 segundos
-
+/* ============ FUNÇÃO: VERIFICAR STATUS DO PIX ============ */
+async function monitorPixStatus(paymentCode, valor, utms, createdAt) {
   const headers = {
     "Authorization": AUTH_HEADER,
     "Store-Code": STORE_CODE_HEADER,
@@ -148,59 +85,43 @@ async function monitorPixStatus(paymentCode, valor, utms, createdAtUtc) {
     "Accept": "application/json"
   };
 
+  let attempts = 0;
   const interval = setInterval(async () => {
     attempts++;
-    if (attempts > maxAttempts) {
+    if (attempts > 7) {
       clearInterval(interval);
       console.log(`[Monitor] Tempo limite atingido para ${paymentCode}`);
       return;
     }
 
-    try {
-      const url = `${MANGOFY_GET_BASE_URL}/${paymentCode}`;
-      const res = await fetch(url, { method: "GET", headers });
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { raw: text };
-      }
+    const res = await fetch(`${MANGOFY_URL}/${paymentCode}`, { headers });
+    const data = await res.json();
+    console.log(`[Monitor] Check #${attempts} - ${paymentCode}: ${data.payment_status}`);
 
-      const status = data.payment_status;
-      console.log(`[Monitor] Check #${attempts} - ${paymentCode}:`, status, "HTTP:", res.status);
-
-      if (status === "approved") {
-        clearInterval(interval);
-        const approvedAtUtc = nowUtcString();
-        await sendToUtmify({
-          paymentCode,
-          status: "paid",
-          valor,
-          utms,
-          createdAtUtc,
-          approvedAtUtc
-        });
-      }
-    } catch (err) {
-      console.error(`[Monitor] ERRO no check de ${paymentCode}:`, err);
+    if (data.payment_status === "approved") {
+      clearInterval(interval);
+      const approvedAt = new Date().toISOString().replace("T", " ").substring(0, 19);
+      await sendToUtmify({
+        paymentCode,
+        status: "paid",
+        valor,
+        utms,
+        createdAt,
+        approvedAt
+      });
     }
-  }, intervalMs);
+  }, 40000); // 40 segundos
 }
 
-/* ============ ROTA /api/pix ============ */
-
+/* ============ ROTA PRINCIPAL /api/pix ============ */
 app.post("/api/pix", async (req, res) => {
   try {
     const valor = req.body.valor;
     const utms = req.body.utms || {};
-
-    if (!valor || typeof valor !== "number") {
-      return res.status(400).json({ error: "valor (em centavos) é obrigatório e deve ser number" });
-    }
+    if (!valor) return res.status(400).json({ error: "valor é obrigatório" });
 
     const externalCode = `dep_${Date.now()}`;
-    const createdAtUtc = nowUtcString();
+    const createdAt = new Date().toISOString().replace("T", " ").substring(0, 19);
 
     const payload = {
       store_code: STORE_CODE_BODY,
@@ -211,27 +132,12 @@ app.post("/api/pix", async (req, res) => {
       payment_format: "regular",
       installments: 1,
       postback_url: "https://raspagreen.cloud/api/webhookmangofy",
-      items: [
-        {
-          code: `DEP-${externalCode}`,
-          amount: 1,
-          price: valor
-        }
-      ],
-      customer: {
-        email: FIXED_CUSTOMER.email,
-        name: FIXED_CUSTOMER.name,
-        document: FIXED_CUSTOMER.document,
-        phone: FIXED_CUSTOMER.phone,
-        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
-      },
-      extra: {
-        utms   // manda as utms cruas pra Mangofy
-      }
+      items: [{ code: `DEP-${externalCode}`, amount: 1, price: valor }],
+      customer: { ...FIXED_CUSTOMER, ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress },
+      extra: { utms }
     };
 
-    // Cria pagamento na Mangofy
-    const mgRes = await fetch(MANGOFY_CREATE_URL, {
+    const mgRes = await fetch(MANGOFY_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -242,61 +148,44 @@ app.post("/api/pix", async (req, res) => {
       body: JSON.stringify(payload)
     });
 
-    const mgText = await mgRes.text();
-    let mgData;
-    try {
-      mgData = JSON.parse(mgText);
-    } catch {
-      mgData = { raw: mgText };
+    const data = await mgRes.json();
+
+    if (!mgRes.ok || !data.payment_code) {
+      console.error("Erro Mangofy:", data);
+      return res.status(500).json({ error: "Erro ao gerar pagamento", details: data });
     }
 
-    if (!mgRes.ok || !mgData.payment_code) {
-      console.error("Erro Mangofy:", mgData);
-      return res.status(500).json({ error: "Erro ao gerar pagamento", details: mgData });
-    }
+    const paymentCode = data.payment_code;
 
-    const paymentCode = mgData.payment_code;
-    console.log("[Mangofy][create] OK:", paymentCode);
-
-    // Envia "Pix Gerado" para UTMify
+    // Envia o evento "Pix Gerado" pra UTMify
     await sendToUtmify({
       paymentCode,
       status: "waiting_payment",
       valor,
       utms,
-      createdAtUtc
+      createdAt
     });
 
-    // Inicia monitoramento assíncrono para saber se foi pago
-    monitorPixStatus(paymentCode, valor, utms, createdAtUtc);
+    // Inicia monitoramento de aprovação
+    monitorPixStatus(paymentCode, valor, utms, createdAt);
 
-    // Resposta para o frontend
-    const qrText =
-      mgData.data?.pix?.pix_qrcode_text ||
-      mgData.pix?.pix_qrcode_text ||
-      null;
-
+    // Retorna pro site o qrcode
     res.json({
       success: true,
       payment_code: paymentCode,
-      pix_qrcode_text: qrText,
-      data: mgData
+      pix_qr: data.qr_code_image || data.pix?.qr_code_base64,
+      data
     });
+
   } catch (err) {
-    console.error("ERRO /api/pix:", err);
+    console.error(err);
     res.status(500).json({ error: "Erro interno ao gerar pagamento" });
   }
 });
 
 /* ============ ROTA TESTE ============ */
-
-app.get("/", (req, res) => {
-  res.json({ ok: true, msg: "API Railway + Mangofy + UTMify ativa 🚀" });
-});
+app.get("/", (req, res) => res.json({ ok: true, msg: "API Railway + UTMify + Mangofy ativa 🚀" }));
 
 /* ============ START SERVER ============ */
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta " + PORT);
-});
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
