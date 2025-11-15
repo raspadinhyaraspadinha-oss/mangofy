@@ -50,6 +50,13 @@ function toCents(value) {
 }
 
 /**
+ * Retorna data/hora atual em UTC no formato "YYYY-MM-DD HH:MM:SS"
+ */
+function nowUtcString() {
+  return new Date().toISOString().slice(0, 19).replace("T", " ");
+}
+
+/**
  * Envia uma ordem para o UTMify (fire-and-forget)
  */
 async function sendToUtmify(order) {
