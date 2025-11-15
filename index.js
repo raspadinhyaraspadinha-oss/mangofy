@@ -83,20 +83,10 @@ function buildUtmifyOrderFromWebhook(body) {
     status = "refunded";
   }
 
-  const createdAt =
-    body.started_at ||
-    body.created_at ||
-    new Date().toISOString().replace("T", " ").slice(0, 19);
-
-  const approvedDate =
-    body.payment_status === "approved"
-      ? (
-          body.approved_at ||
-          body.paid_at ||
-          body.updated_at ||
-          new Date().toISOString().replace("T", " ").slice(0, 19)
-        )
-      : null;
+  // Usamos SEMPRE o horário atual em UTC
+  const createdAt = nowUtcString();
+  const approvedDate = status === "paid" ? nowUtcString() : null;
+  const refundedAt = status === "refunded" ? nowUtcString() : null;
 
   const paymentAmountCents = toCents(body.payment_amount);
   const saleAmountCents = toCents(body.sale_amount);
@@ -149,7 +139,7 @@ function buildUtmifyOrderFromWebhook(body) {
     status,
     createdAt,
     approvedDate,
-    refundedAt: status === "refunded" ? body.refunded_at || null : null,
+    refundedAt,
     customer: {
       name: customer.name || "",
       email: customer.email || "",
