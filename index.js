@@ -39,7 +39,7 @@ app.post("/api/pix", async (req, res) => {
     }
 
     // pode vir um objeto utms ou uma string
-    const utms = req.body.utms || {};
+    const utms = req.body.utms || null;
 
     const externalCode = `dep_${Date.now()}`;
 
@@ -68,11 +68,21 @@ app.post("/api/pix", async (req, res) => {
         phone: FIXED_CUSTOMER.phone,
         ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || ""
       },
+
+      // dados para antifraude + UTMs também aqui
       extra: {
         cybersource_fingerprint: "",
         seon_fingerprint: "",
-        utms: utms   // <<<<<<<<<< aqui vai exatamente o que o site mandar
-      }
+        utms: utms // << aqui vai exatamente o que o site mandar
+      },
+
+      // UTMs também em metadata, no formato de objeto
+      metadata:
+        utms && typeof utms === "object"
+          ? { ...utms }          // se vier objeto, espalha as chaves
+          : utms
+          ? { utms }             // se vier string, guarda em uma chave "utms"
+          : {}                   // se não vier nada, manda objeto vazio
     };
 
     const mgRes = await fetch(MANGOFY_URL, {
