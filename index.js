@@ -35,11 +35,34 @@ app.post("/api/pix", async (req, res) => {
       req.body.amount;
 
     if (!valor) {
-      return res.status(400).json({ error: "valor (em centavos) é obrigatório" });
+      return res
+        .status(400)
+        .json({ error: "valor (em centavos) é obrigatório" });
     }
 
     // pode vir um objeto utms ou uma string
-    const utms = req.body.utms || null;
+    const utmsRaw = req.body.utms || {};
+
+    // garante que tudo vira string (a API costuma gostar disso)
+    const metadataUtms = {
+      utm_source: utmsRaw.utm_source ? String(utmsRaw.utm_source) : undefined,
+      utm_medium: utmsRaw.utm_medium ? String(utmsRaw.utm_medium) : undefined,
+      utm_campaign: utmsRaw.utm_campaign ? String(utmsRaw.utm_campaign) : undefined,
+      utm_content: utmsRaw.utm_content ? String(utmsRaw.utm_content) : undefined,
+      utm_term: utmsRaw.utm_term ? String(utmsRaw.utm_term) : undefined
+    };
+
+    // remove as chaves undefined
+    Object.keys(metadataUtms).forEach((k) => {
+      if (metadataUtms[k] === undefined) delete metadataUtms[k];
+    });
+
+    const ip =
+      req.headers["x-forwarded-for"] ||
+      req.socket.remoteAddress ||
+      "";
+
+    const userAgent = req.headers["user-agent"] || "";
 
     const externalCode = `dep_${Date.now()}`;
 
@@ -66,37 +89,48 @@ app.post("/api/pix", async (req, res) => {
         name: FIXED_CUSTOMER.name,
         document: FIXED_CUSTOMER.document,
         phone: FIXED_CUSTOMER.phone,
-        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || ""
+        ip
       },
 
-      // dados para antifraude + UTMs também aqui
+      // 👉 metadata no topo (algumas plataformas já leem direto daqui)
+      metadata: {
+        ...metadataUtms,
+        ip,
+        user_agent: userAgent
+      },
+
+      // 👉 extra.metadata: é onde a doc da Mangofy mostra o metadata
       extra: {
         cybersource_fingerprint: "",
         seon_fingerprint: "",
-        utms: utms // << aqui vai exatamente o que o site mandar
-      },
-
-      // UTMs também em metadata, no formato de objeto
-      metadata:
-        utms && typeof utms === "object"
-          ? { ...utms }          // se vier objeto, espalha as chaves
-          : utms
-          ? { utms }             // se vier string, guarda em uma chave "utms"
-          : {}                   // se não vier nada, manda objeto vazio
+        // mantemos utms cru, se você quiser usar pra debug depois
+        utms: utmsRaw,
+        userAgent,
+        browser: "",
+        metadata: {
+          ...metadataUtms,
+          ip,
+          user_agent: userAgent
+        }
+      }
     };
+
+    // log opcional pra depurar o que está indo pra Mangofy
+    console.log("[PAYLOAD MANGOFY]", JSON.stringify(payload, null, 2));
 
     const mgRes = await fetch(MANGOFY_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        Accept: "application/json",
         "Store-Code": STORE_CODE_HEADER,
-        "Authorization": AUTH_HEADER
+        Authorization: AUTH_HEADER
       },
       body: JSON.stringify(payload)
     });
 
     const data = await mgRes.json();
+    console.log("[RESPOSTA MANGOFY]", mgRes.status, data);
     res.status(mgRes.status).json(data);
   } catch (err) {
     console.error("Erro ao gerar pagamento:", err);
