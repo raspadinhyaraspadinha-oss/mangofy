@@ -24,12 +24,17 @@ const POSTBACK_URL =
 const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
 const UTMIFY_API_TOKEN = "o3TW8mrJa7xcrr19toAWtKwWE3Hf57xyhGpk";
 
-// 🔥 TikTok Events API (CAPI)
+// 🔥 TikTok Events API 2.0
+// Doc geral da Events API & mapeamento event_source/event_source_id/ttclid:
+// https://ads.tiktok.com/help/article/events-api (visão geral) :contentReference[oaicite:0]{index=0}
 const TIKTOK_EVENTS_API_URL =
-  "https://business-api.tiktok.com/open_api/v1.3/pixel/track/";
+  process.env.TIKTOK_EVENTS_API_URL ||
+  "https://business-api.tiktok.com/open_api/v1.3/event/track/";
 const TIKTOK_PIXEL_CODE =
-  process.env.TIKTOK_PIXEL_CODE || "D31JEHRC77U7TGIRBPQ0"; // seu pixel
+  process.env.TIKTOK_PIXEL_CODE || "D31JEHRC77U7TGIRBPQ0"; // seu Pixel ID → event_source_id para web :contentReference[oaicite:1]{index=1}
 const TIKTOK_ACCESS_TOKEN = process.env.TIKTOK_ACCESS_TOKEN; // gerar no Events Manager
+// opcional: código de teste da aba "Test Events" no Events Manager
+const TIKTOK_TEST_EVENT_CODE = process.env.TIKTOK_TEST_EVENT_CODE || null;
 
 // dados fixos do cliente
 const FIXED_CUSTOMER = {
@@ -90,15 +95,26 @@ function sha256Lower(value) {
 }
 
 /**
- * Monta payload para TikTok Events API
+ * Extrai IP do header x-forwarded-for ou string múltipla
+ */
+function extractClientIp(raw) {
+  if (!raw) return "";
+  if (Array.isArray(raw)) raw = raw[0];
+  const str = String(raw);
+  return str.split(",")[0].trim();
+}
+
+/**
+ * Monta payload para TikTok Events API 2.0
  *
- * eventName: AddToCart | CompletePayment | ...
- * eventId: id único por evento (pode usar payment_code / external_code)
- * valueInCents: inteiro em centavos (ex.: 2000 = R$20,00)
+ * eventName: AddToCart | Purchase | ...
+ * eventId: id único por evento (usar o event_id vindo do front quando tiver)
+ * valueInCents: inteiro em centavos (ex.: 2000 = R$20,00) → TikTok recebe 20
  * utms: objeto com utm_source, utm_medium, utm_campaign, utm_content, utm_term, ttclid etc.
  * ip, userAgent: dados de contexto
  * customer: { email, phone, document }
  * pageUrl/referrer: URL da página onde ocorreu o evento (se tiver)
+ * eventTime: unix timestamp em segundos (se não passar, uso Date.now()/1000)
  */
 function buildTikTokEventPayload({
   eventName,
@@ -110,12 +126,18 @@ function buildTikTokEventPayload({
   userAgent,
   customer = {},
   pageUrl,
-  referrer
+  referrer,
+  eventTime
 }) {
   const value =
     typeof valueInCents === "number" && !Number.isNaN(valueInCents)
       ? valueInCents / 100
       : null;
+
+  const ts =
+    typeof eventTime === "number"
+      ? eventTime
+      : Math.floor(Date.now() / 1000); // event_time em segundos
 
   const hashedEmail = customer.email ? sha256Lower(customer.email) : null;
   const hashedPhone = customer.phone ? sha256Lower(customer.phone) : null;
@@ -123,37 +145,19 @@ function buildTikTokEventPayload({
     ? sha256Lower(String(customer.document))
     : null;
 
-  const userContext = {};
-  if (hashedExternalId) userContext.external_id = hashedExternalId;
-  if (hashedEmail) userContext.email = hashedEmail;
-  if (hashedPhone) userContext.phone_number = hashedPhone;
+  const user = {};
+  if (hashedExternalId) user.external_id = hashedExternalId;
+  if (hashedEmail) user.email = hashedEmail;
+  if (hashedPhone) user.phone = hashedPhone;
 
-  const context = {
-    ad: {},
-    page: {},
-    user: userContext
-  };
-
-  if (pageUrl) {
-    context.page.url = pageUrl;
-  }
-  if (referrer) {
-    context.page.referrer = referrer;
-  }
-  if (ip) {
-    context.ip = ip;
-  }
-  if (userAgent) {
-    context.user_agent = userAgent;
-  }
-
-  // Se você mandar ttclid no body.utms (por ex. utms.ttclid), mapeio pra callback
+  // ttclid deve ir em user.ttclid no Events 2.0 :contentReference[oaicite:2]{index=2}
   if (utms.ttclid || utms.ttc_id || utms.tt_clickid) {
-    context.ad.callback = String(
+    user.ttclid = String(
       utms.ttclid || utms.ttc_id || utms.tt_clickid
     );
   }
 
+  // monta properties com utms + valor
   const utmProps = {};
   ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"].forEach(
     (k) => {
@@ -163,28 +167,37 @@ function buildTikTokEventPayload({
     }
   );
 
-  const properties = { ...utmProps };
+  const properties = {
+    ...utmProps
+  };
 
   if (value != null) {
-    properties.value = value;
-    properties.currency = currency;
-    properties.contents = [
-      {
-        content_id: eventId,
-        content_type: "product",
-        quantity: 1,
-        price: value
-      }
-    ];
+    properties.value = value;       // ex.: 20
+    properties.currency = currency; // "BRL"
+    properties.content_type = "product";
+    // se quiser, pode mandar um identificador de produto:
+    if (eventId) {
+      properties.content_id = eventId;
+    }
   }
 
+  const page = {};
+  if (pageUrl) page.url = pageUrl;
+  if (referrer) page.referrer = referrer || null;
+
   return {
-    pixel_code: TIKTOK_PIXEL_CODE,
-    event: eventName,
-    event_id: eventId,
-    timestamp: new Date().toISOString(), // TikTok aceita ISO8601
-    context,
-    properties
+    event_source: "web",              // web / app / offline / crm :contentReference[oaicite:3]{index=3}
+    event_source_id: TIKTOK_PIXEL_CODE, // para web = Pixel ID :contentReference[oaicite:4]{index=4}
+    data: [
+      {
+        event: eventName,
+        event_time: ts,
+        event_id: eventId || null,
+        user,
+        properties,
+        page
+      }
+    ]
   };
 }
 
@@ -200,7 +213,13 @@ async function sendTikTokEvent(payload) {
   }
 
   try {
+    // se estiver em modo de teste, adiciona test_event_code
+    if (TIKTOK_TEST_EVENT_CODE) {
+      payload.test_event_code = TIKTOK_TEST_EVENT_CODE;
+    }
+
     console.log("[TIKTOK ENVIANDO]", JSON.stringify(payload, null, 2));
+
     const res = await fetch(TIKTOK_EVENTS_API_URL, {
       method: "POST",
       headers: {
@@ -211,12 +230,13 @@ async function sendTikTokEvent(payload) {
     });
 
     const text = await res.text();
-    console.log(
-      "[TIKTOK RESPOSTA]",
-      payload.event,
-      res.status,
-      text.slice(0, 500)
-    );
+
+    let evtName = "unknown";
+    if (payload && payload.data && payload.data[0] && payload.data[0].event) {
+      evtName = payload.data[0].event;
+    }
+
+    console.log("[TIKTOK RESPOSTA]", evtName, res.status, text.slice(0, 500));
   } catch (err) {
     console.error("Erro ao enviar evento para TikTok:", err);
   }
@@ -364,17 +384,19 @@ app.post("/api/pix", async (req, res) => {
       if (metadataUtms[k] === undefined) delete metadataUtms[k];
     });
 
-    const ip =
-      req.headers["x-forwarded-for"] ||
-      req.socket.remoteAddress ||
-      "";
+    const ip = extractClientIp(
+      req.headers["x-forwarded-for"] || req.socket.remoteAddress || ""
+    );
 
     const userAgent = req.headers["user-agent"] || "";
 
     const pageReferrer = req.headers["referer"] || null;
     const pageUrl = pageReferrer || null;
 
+    // event_id vindo do front (index.html). Se não vier, fallback pro externalCode.
     const externalCode = `dep_${Date.now()}`;
+    const eventIdFromFront = req.body.event_id;
+    const eventId = eventIdFromFront || externalCode;
 
     const payload = {
       store_code: STORE_CODE_BODY,
@@ -405,7 +427,8 @@ app.post("/api/pix", async (req, res) => {
       metadata: {
         ...metadataUtms,
         ip,
-        user_agent: userAgent
+        user_agent: userAgent,
+        event_id: eventId // propaga event_id também na metadata
       },
       extra: {
         cybersource_fingerprint: "",
@@ -416,7 +439,8 @@ app.post("/api/pix", async (req, res) => {
         metadata: {
           ...metadataUtms,
           ip,
-          user_agent: userAgent
+          user_agent: userAgent,
+          event_id: eventId
         }
       }
     };
@@ -442,7 +466,7 @@ app.post("/api/pix", async (req, res) => {
       const valueInCents = normalizeCentsInt(valor);
       const tikTokPayload = buildTikTokEventPayload({
         eventName: "AddToCart",
-        eventId: externalCode,
+        eventId, // usa o event_id vindo do front
         valueInCents,
         currency: "BRL",
         utms: {
@@ -486,7 +510,7 @@ app.post("/api/webhookmangofy", async (req, res) => {
       console.error("Erro no envio assíncrono para UTMify:", err);
     });
 
-    // 🔔 TIKTOK: CompletePayment quando pagamento aprovado
+    // 🔔 TIKTOK: Purchase quando pagamento aprovado
     try {
       if (body.payment_status === "approved") {
         const valueInCents = toCents(body.payment_amount) || 0;
@@ -501,29 +525,38 @@ app.post("/api/webhookmangofy", async (req, res) => {
 
         const customerFromWebhook = body.customer || {};
 
+        // tenta reaproveitar o mesmo event_id se veio na metadata; senão cria outro
+        const eventId =
+          metadata.event_id ||
+          (metadata.metadata && metadata.metadata.event_id) ||
+          body.payment_code ||
+          body.external_code ||
+          `pay_${Date.now()}`;
+
         const tikTokPayload = buildTikTokEventPayload({
-          eventName: "CompletePayment",
-          eventId: body.payment_code || body.external_code || `pay_${Date.now()}`,
+          eventName: "Purchase", // padrão do funil do TikTok
+          eventId,
           valueInCents,
           currency: "BRL",
           utms: utmsFromMetadata,
-          ip: metadata.ip || "",
+          ip: extractClientIp(metadata.ip || ""),
           userAgent: metadata.user_agent || "",
           customer: {
             email: customerFromWebhook.email || FIXED_CUSTOMER.email,
             phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
-            document: customerFromWebhook.document || FIXED_CUSTOMER.document
+            document:
+              customerFromWebhook.document || FIXED_CUSTOMER.document
           },
           pageUrl: null,
           referrer: null
         });
 
         sendTikTokEvent(tikTokPayload).catch((err) => {
-          console.error("[TIKTOK] Erro async CompletePayment:", err);
+          console.error("[TIKTOK] Erro async Purchase:", err);
         });
       }
     } catch (err) {
-      console.error("[TIKTOK] Erro ao montar/enviar CompletePayment:", err);
+      console.error("[TIKTOK] Erro ao montar/enviar Purchase:", err);
     }
 
     res.status(200).json({ received: true });
