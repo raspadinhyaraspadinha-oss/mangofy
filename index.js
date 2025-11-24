@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 const app = express();
 app.use(cors());
@@ -22,6 +23,13 @@ const POSTBACK_URL =
 // UTMify
 const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
 const UTMIFY_API_TOKEN = "o3TW8mrJa7xcrr19toAWtKwWE3Hf57xyhGpk";
+
+// 🔥 TikTok Events API (CAPI)
+const TIKTOK_EVENTS_API_URL =
+  "https://business-api.tiktok.com/open_api/v1.3/pixel/track/";
+const TIKTOK_PIXEL_CODE =
+  process.env.TIKTOK_PIXEL_CODE || "D31JEHRC77U7TGIRBPQ0"; // seu pixel
+const TIKTOK_ACCESS_TOKEN = process.env.TIKTOK_ACCESS_TOKEN; // gerar no Events Manager
 
 // dados fixos do cliente
 const FIXED_CUSTOMER = {
@@ -50,10 +58,168 @@ function toCents(value) {
 }
 
 /**
+ * Converte valor em centavos (string ou number) para inteiro
+ * sem mexer na escala. Ex.: "2000" -> 2000
+ */
+function normalizeCentsInt(value) {
+  if (value == null) return null;
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const n = parseInt(value, 10);
+    return Number.isNaN(n) ? null : n;
+  }
+  return null;
+}
+
+/**
  * Retorna data/hora atual em UTC no formato "YYYY-MM-DD HH:MM:SS"
  */
 function nowUtcString() {
   return new Date().toISOString().slice(0, 19).replace("T", " ");
+}
+
+/**
+ * SHA256 helper (TikTok recomenda dados de usuário hasheados)
+ */
+function sha256Lower(value) {
+  if (!value) return null;
+  return crypto
+    .createHash("sha256")
+    .update(String(value).trim().toLowerCase())
+    .digest("hex");
+}
+
+/**
+ * Monta payload para TikTok Events API
+ *
+ * eventName: AddToCart | CompletePayment | ...
+ * eventId: id único por evento (pode usar payment_code / external_code)
+ * valueInCents: inteiro em centavos (ex.: 2000 = R$20,00)
+ * utms: objeto com utm_source, utm_medium, utm_campaign, utm_content, utm_term, ttclid etc.
+ * ip, userAgent: dados de contexto
+ * customer: { email, phone, document }
+ * pageUrl/referrer: URL da página onde ocorreu o evento (se tiver)
+ */
+function buildTikTokEventPayload({
+  eventName,
+  eventId,
+  valueInCents,
+  currency = "BRL",
+  utms = {},
+  ip,
+  userAgent,
+  customer = {},
+  pageUrl,
+  referrer
+}) {
+  const value =
+    typeof valueInCents === "number" && !Number.isNaN(valueInCents)
+      ? valueInCents / 100
+      : null;
+
+  const hashedEmail = customer.email ? sha256Lower(customer.email) : null;
+  const hashedPhone = customer.phone ? sha256Lower(customer.phone) : null;
+  const hashedExternalId = customer.document
+    ? sha256Lower(String(customer.document))
+    : null;
+
+  const userContext = {};
+  if (hashedExternalId) userContext.external_id = hashedExternalId;
+  if (hashedEmail) userContext.email = hashedEmail;
+  if (hashedPhone) userContext.phone_number = hashedPhone;
+
+  const context = {
+    ad: {},
+    page: {},
+    user: userContext
+  };
+
+  if (pageUrl) {
+    context.page.url = pageUrl;
+  }
+  if (referrer) {
+    context.page.referrer = referrer;
+  }
+  if (ip) {
+    context.ip = ip;
+  }
+  if (userAgent) {
+    context.user_agent = userAgent;
+  }
+
+  // Se você mandar ttclid no body.utms (por ex. utms.ttclid), mapeio pra callback
+  if (utms.ttclid || utms.ttc_id || utms.tt_clickid) {
+    context.ad.callback = String(
+      utms.ttclid || utms.ttc_id || utms.tt_clickid
+    );
+  }
+
+  const utmProps = {};
+  ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"].forEach(
+    (k) => {
+      if (utms && utms[k]) {
+        utmProps[k] = String(utms[k]);
+      }
+    }
+  );
+
+  const properties = { ...utmProps };
+
+  if (value != null) {
+    properties.value = value;
+    properties.currency = currency;
+    properties.contents = [
+      {
+        content_id: eventId,
+        content_type: "product",
+        quantity: 1,
+        price: value
+      }
+    ];
+  }
+
+  return {
+    pixel_code: TIKTOK_PIXEL_CODE,
+    event: eventName,
+    event_id: eventId,
+    timestamp: new Date().toISOString(), // TikTok aceita ISO8601
+    context,
+    properties
+  };
+}
+
+/**
+ * Envia evento pro TikTok Events API (server-side)
+ */
+async function sendTikTokEvent(payload) {
+  if (!TIKTOK_PIXEL_CODE || !TIKTOK_ACCESS_TOKEN) {
+    console.warn(
+      "[TIKTOK] Pixel code ou Access Token não configurados. Evento não enviado."
+    );
+    return;
+  }
+
+  try {
+    console.log("[TIKTOK ENVIANDO]", JSON.stringify(payload, null, 2));
+    const res = await fetch(TIKTOK_EVENTS_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Token": TIKTOK_ACCESS_TOKEN
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await res.text();
+    console.log(
+      "[TIKTOK RESPOSTA]",
+      payload.event,
+      res.status,
+      text.slice(0, 500)
+    );
+  } catch (err) {
+    console.error("Erro ao enviar evento para TikTok:", err);
+  }
 }
 
 /**
@@ -153,7 +319,7 @@ function buildUtmifyOrderFromWebhook(body) {
       phone: String(customer.phone || ""),
       document: String(customer.document || ""),
       country: "BR",
-      ip: "" // Mangofy não envia IP no webhook
+      ip: "" // Mangofy não envia IP no webhook (mas temos ip no metadata do pagamento)
     },
     products,
     trackingParameters,
@@ -185,8 +351,12 @@ app.post("/api/pix", async (req, res) => {
     const metadataUtms = {
       utm_source: utmsRaw.utm_source ? String(utmsRaw.utm_source) : undefined,
       utm_medium: utmsRaw.utm_medium ? String(utmsRaw.utm_medium) : undefined,
-      utm_campaign: utmsRaw.utm_campaign ? String(utmsRaw.utm_campaign) : undefined,
-      utm_content: utmsRaw.utm_content ? String(utmsRaw.utm_content) : undefined,
+      utm_campaign: utmsRaw.utm_campaign
+        ? String(utmsRaw.utm_campaign)
+        : undefined,
+      utm_content: utmsRaw.utm_content
+        ? String(utmsRaw.utm_content)
+        : undefined,
       utm_term: utmsRaw.utm_term ? String(utmsRaw.utm_term) : undefined
     };
 
@@ -200,6 +370,9 @@ app.post("/api/pix", async (req, res) => {
       "";
 
     const userAgent = req.headers["user-agent"] || "";
+
+    const pageReferrer = req.headers["referer"] || null;
+    const pageUrl = pageReferrer || null;
 
     const externalCode = `dep_${Date.now()}`;
 
@@ -264,6 +437,33 @@ app.post("/api/pix", async (req, res) => {
     const data = await mgRes.json();
     console.log("[RESPOSTA MANGOFY]", mgRes.status, data);
 
+    // 🔔 TIKTOK: AddToCart quando o QRCode/PIX é gerado
+    try {
+      const valueInCents = normalizeCentsInt(valor);
+      const tikTokPayload = buildTikTokEventPayload({
+        eventName: "AddToCart",
+        eventId: externalCode,
+        valueInCents,
+        currency: "BRL",
+        utms: {
+          ...utmsRaw,
+          ...metadataUtms
+        },
+        ip,
+        userAgent,
+        customer: FIXED_CUSTOMER,
+        pageUrl,
+        referrer: pageReferrer
+      });
+
+      // fire-and-forget para não travar o response
+      sendTikTokEvent(tikTokPayload).catch((err) => {
+        console.error("[TIKTOK] Erro async AddToCart:", err);
+      });
+    } catch (err) {
+      console.error("[TIKTOK] Erro ao montar evento AddToCart:", err);
+    }
+
     res.status(mgRes.status).json(data);
   } catch (err) {
     console.error("Erro ao gerar pagamento:", err);
@@ -285,6 +485,46 @@ app.post("/api/webhookmangofy", async (req, res) => {
     sendToUtmify(utmifyOrder).catch((err) => {
       console.error("Erro no envio assíncrono para UTMify:", err);
     });
+
+    // 🔔 TIKTOK: CompletePayment quando pagamento aprovado
+    try {
+      if (body.payment_status === "approved") {
+        const valueInCents = toCents(body.payment_amount) || 0;
+
+        const metadata = body.metadata || {};
+        // se no /api/pix você mandar utms dentro de extra.utms,
+        // alguns gateways devolvem isso no metadata
+        const utmsFromMetadata =
+          metadata.utms && typeof metadata.utms === "object"
+            ? metadata.utms
+            : metadata;
+
+        const customerFromWebhook = body.customer || {};
+
+        const tikTokPayload = buildTikTokEventPayload({
+          eventName: "CompletePayment",
+          eventId: body.payment_code || body.external_code || `pay_${Date.now()}`,
+          valueInCents,
+          currency: "BRL",
+          utms: utmsFromMetadata,
+          ip: metadata.ip || "",
+          userAgent: metadata.user_agent || "",
+          customer: {
+            email: customerFromWebhook.email || FIXED_CUSTOMER.email,
+            phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
+            document: customerFromWebhook.document || FIXED_CUSTOMER.document
+          },
+          pageUrl: null,
+          referrer: null
+        });
+
+        sendTikTokEvent(tikTokPayload).catch((err) => {
+          console.error("[TIKTOK] Erro async CompletePayment:", err);
+        });
+      }
+    } catch (err) {
+      console.error("[TIKTOK] Erro ao montar/enviar CompletePayment:", err);
+    }
 
     res.status(200).json({ received: true });
   } catch (err) {
