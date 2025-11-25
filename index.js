@@ -25,15 +25,12 @@ const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
 const UTMIFY_API_TOKEN = "o3TW8mrJa7xcrr19toAWtKwWE3Hf57xyhGpk";
 
 // 🔥 TikTok Events API 2.0
-// Doc geral da Events API & mapeamento event_source/event_source_id/ttclid:
-// https://ads.tiktok.com/help/article/events-api (visão geral) :contentReference[oaicite:0]{index=0}
 const TIKTOK_EVENTS_API_URL =
   process.env.TIKTOK_EVENTS_API_URL ||
   "https://business-api.tiktok.com/open_api/v1.3/event/track/";
 const TIKTOK_PIXEL_CODE =
-  process.env.TIKTOK_PIXEL_CODE || "D31JEHRC77U7TGIRBPQ0"; // seu Pixel ID → event_source_id para web :contentReference[oaicite:1]{index=1}
-const TIKTOK_ACCESS_TOKEN = process.env.TIKTOK_ACCESS_TOKEN; // gerar no Events Manager
-// opcional: código de teste da aba "Test Events" no Events Manager
+  process.env.TIKTOK_PIXEL_CODE || "D31JEHRC77U7TGIRBPQ0";
+const TIKTOK_ACCESS_TOKEN = process.env.TIKTOK_ACCESS_TOKEN;
 const TIKTOK_TEST_EVENT_CODE = process.env.TIKTOK_TEST_EVENT_CODE || null;
 
 // dados fixos do cliente
@@ -106,15 +103,6 @@ function extractClientIp(raw) {
 
 /**
  * Monta payload para TikTok Events API 2.0
- *
- * eventName: AddToCart | Purchase | ...
- * eventId: id único por evento (usar o event_id vindo do front quando tiver)
- * valueInCents: inteiro em centavos (ex.: 2000 = R$20,00) → TikTok recebe 20
- * utms: objeto com utm_source, utm_medium, utm_campaign, utm_content, utm_term, ttclid etc.
- * ip, userAgent: dados de contexto
- * customer: { email, phone, document }
- * pageUrl/referrer: URL da página onde ocorreu o evento (se tiver)
- * eventTime: unix timestamp em segundos (se não passar, uso Date.now()/1000)
  */
 function buildTikTokEventPayload({
   eventName,
@@ -150,7 +138,7 @@ function buildTikTokEventPayload({
   if (hashedEmail) user.email = hashedEmail;
   if (hashedPhone) user.phone = hashedPhone;
 
-  // ttclid deve ir em user.ttclid no Events 2.0 :contentReference[oaicite:2]{index=2}
+  // ttclid deve ir em user.ttclid no Events 2.0
   if (utms.ttclid || utms.ttc_id || utms.tt_clickid) {
     user.ttclid = String(
       utms.ttclid || utms.ttc_id || utms.tt_clickid
@@ -175,7 +163,6 @@ function buildTikTokEventPayload({
     properties.value = value;       // ex.: 20
     properties.currency = currency; // "BRL"
     properties.content_type = "product";
-    // se quiser, pode mandar um identificador de produto:
     if (eventId) {
       properties.content_id = eventId;
     }
@@ -186,8 +173,8 @@ function buildTikTokEventPayload({
   if (referrer) page.referrer = referrer || null;
 
   return {
-    event_source: "web",              // web / app / offline / crm :contentReference[oaicite:3]{index=3}
-    event_source_id: TIKTOK_PIXEL_CODE, // para web = Pixel ID :contentReference[oaicite:4]{index=4}
+    event_source: "web",
+    event_source_id: TIKTOK_PIXEL_CODE,
     data: [
       {
         event: eventName,
@@ -213,7 +200,6 @@ async function sendTikTokEvent(payload) {
   }
 
   try {
-    // se estiver em modo de teste, adiciona test_event_code
     if (TIKTOK_TEST_EVENT_CODE) {
       payload.test_event_code = TIKTOK_TEST_EVENT_CODE;
     }
@@ -268,7 +254,6 @@ async function sendToUtmify(order) {
  * Constrói o payload para o UTMify a partir do webhook da Mangofy
  */
 function buildUtmifyOrderFromWebhook(body) {
-  // Mapeia status Mangofy -> status UTMify
   let status = "waiting_payment";
   if (body.payment_status === "approved") {
     status = "paid";
@@ -276,7 +261,6 @@ function buildUtmifyOrderFromWebhook(body) {
     status = "refunded";
   }
 
-  // Usamos SEMPRE o horário atual em UTC
   const createdAt = nowUtcString();
   const approvedDate = status === "paid" ? nowUtcString() : null;
   const refundedAt = status === "refunded" ? nowUtcString() : null;
@@ -339,7 +323,7 @@ function buildUtmifyOrderFromWebhook(body) {
       phone: String(customer.phone || ""),
       document: String(customer.document || ""),
       country: "BR",
-      ip: "" // Mangofy não envia IP no webhook (mas temos ip no metadata do pagamento)
+      ip: ""
     },
     products,
     trackingParameters,
@@ -393,10 +377,15 @@ app.post("/api/pix", async (req, res) => {
     const pageReferrer = req.headers["referer"] || null;
     const pageUrl = pageReferrer || null;
 
-    // event_id vindo do front (index.html). Se não vier, fallback pro externalCode.
     const externalCode = `dep_${Date.now()}`;
     const eventIdFromFront = req.body.event_id;
     const eventId = eventIdFromFront || externalCode;
+
+    // 🔗 junta tudo que é UTM / IDs em um objeto só
+    const allUtms = {
+      ...utmsRaw,
+      ...metadataUtms
+    };
 
     const payload = {
       store_code: STORE_CODE_BODY,
@@ -408,7 +397,6 @@ app.post("/api/pix", async (req, res) => {
       },
       payment_format: "regular",
       installments: 1,
-      // 🔥 AGORA usando a URL certa da Railway
       postback_url: POSTBACK_URL,
       items: [
         {
@@ -424,20 +412,25 @@ app.post("/api/pix", async (req, res) => {
         phone: FIXED_CUSTOMER.phone,
         ip
       },
+      // ⬇️ AQUI: grava ttclid e demais UTMs direto em metadata
       metadata: {
-        ...metadataUtms,
+        ...metadataUtms,    // utm_source/medium/campaign/content/term
+        ...utmsRaw,         // ttclid, fbclid, etc (flatten)
+        utms: allUtms,      // cópia agrupada (caso a Mangofy preserve objeto)
         ip,
         user_agent: userAgent,
-        event_id: eventId // propaga event_id também na metadata
+        event_id: eventId
       },
       extra: {
         cybersource_fingerprint: "",
         seon_fingerprint: "",
-        utms: utmsRaw,
+        utms: allUtms,
         userAgent,
         browser: "",
         metadata: {
           ...metadataUtms,
+          ...utmsRaw,
+          utms: allUtms,
           ip,
           user_agent: userAgent,
           event_id: eventId
@@ -466,13 +459,10 @@ app.post("/api/pix", async (req, res) => {
       const valueInCents = normalizeCentsInt(valor);
       const tikTokPayload = buildTikTokEventPayload({
         eventName: "AddToCart",
-        eventId, // usa o event_id vindo do front
+        eventId,
         valueInCents,
         currency: "BRL",
-        utms: {
-          ...utmsRaw,
-          ...metadataUtms
-        },
+        utms: allUtms,
         ip,
         userAgent,
         customer: FIXED_CUSTOMER,
@@ -480,7 +470,6 @@ app.post("/api/pix", async (req, res) => {
         referrer: pageReferrer
       });
 
-      // fire-and-forget para não travar o response
       sendTikTokEvent(tikTokPayload).catch((err) => {
         console.error("[TIKTOK] Erro async AddToCart:", err);
       });
@@ -505,7 +494,6 @@ app.post("/api/webhookmangofy", async (req, res) => {
 
     const utmifyOrder = buildUtmifyOrderFromWebhook(body);
 
-    // dispara pro UTMify sem travar a resposta do webhook
     sendToUtmify(utmifyOrder).catch((err) => {
       console.error("Erro no envio assíncrono para UTMify:", err);
     });
@@ -516,8 +504,8 @@ app.post("/api/webhookmangofy", async (req, res) => {
         const valueInCents = toCents(body.payment_amount) || 0;
 
         const metadata = body.metadata || {};
-        // se no /api/pix você mandar utms dentro de extra.utms,
-        // alguns gateways devolvem isso no metadata
+        // se a Mangofy devolver metadata.utms (objeto), usa ele;
+        // senão, usa o próprio metadata (que agora já tem ttclid flatten)
         const utmsFromMetadata =
           metadata.utms && typeof metadata.utms === "object"
             ? metadata.utms
@@ -525,7 +513,6 @@ app.post("/api/webhookmangofy", async (req, res) => {
 
         const customerFromWebhook = body.customer || {};
 
-        // tenta reaproveitar o mesmo event_id se veio na metadata; senão cria outro
         const eventId =
           metadata.event_id ||
           (metadata.metadata && metadata.metadata.event_id) ||
@@ -534,11 +521,11 @@ app.post("/api/webhookmangofy", async (req, res) => {
           `pay_${Date.now()}`;
 
         const tikTokPayload = buildTikTokEventPayload({
-          eventName: "Purchase", // padrão do funil do TikTok
+          eventName: "Purchase",
           eventId,
           valueInCents,
           currency: "BRL",
-          utms: utmsFromMetadata,
+          utms: utmsFromMetadata, // ⬅️ agora deve conter ttclid
           ip: extractClientIp(metadata.ip || ""),
           userAgent: metadata.user_agent || "",
           customer: {
