@@ -50,7 +50,8 @@ const FIXED_CUSTOMER = {
 };
 
 // memória simples pra front saber status do pagamento
-// paymentStatus[payment_code] = { status, amount, utms }
+// paymentStatus[chave] = { status, amount, utms, payment_code, event_id }
+// a chave pode ser tanto o payment_code quanto o event_id
 const paymentStatus = {};
 
 app.get("/", (req, res) => {
@@ -644,11 +645,17 @@ app.post("/api/pix", async (req, res) => {
 
     // guarda status inicial em memória pra front poder consultar
     if (data && data.payment_code) {
-      paymentStatus[data.payment_code] = {
+      const statusObj = {
         status: data.payment_status || "pending",
         amount: valor,
-        utms: allUtms
+        utms: allUtms,
+        payment_code: data.payment_code,
+        event_id: eventId
       };
+      paymentStatus[data.payment_code] = statusObj;
+      if (eventId) {
+        paymentStatus[eventId] = statusObj;
+      }
     }
 
     // 🔔 TIKTOK: AddToCart
@@ -705,13 +712,20 @@ app.post("/api/pix", async (req, res) => {
 });
 
 /**
- * Endpoint para o front consultar status do pagamento
- * GET /api/payment-status?payment_code=...
+ * Endpoint para o front (ou PHP) consultar status do pagamento
+ * Aceita payment_code, event_id ou id_transacao como chave
+ * GET /api/payment-status?event_id=...  (recomendado)
  */
 app.get("/api/payment-status", (req, res) => {
-  const code = req.query.payment_code;
+  const code =
+    req.query.payment_code ||
+    req.query.event_id ||
+    req.query.id_transacao;
+
   if (!code) {
-    return res.status(400).json({ error: "payment_code é obrigatório" });
+    return res
+      .status(400)
+      .json({ error: "payment_code ou event_id é obrigatório" });
   }
 
   const info = paymentStatus[code];
@@ -728,6 +742,7 @@ app.get("/api/payment-status", (req, res) => {
 app.post("/api/webhookmangofy", async (req, res) => {
   try {
     const body = req.body;
+    const metadata = body.metadata || {};
     console.log("[WEBHOOK MANGOFY RECEBIDO]", JSON.stringify(body, null, 2));
 
     const utmifyOrder = buildUtmifyOrderFromWebhook(body);
@@ -740,18 +755,30 @@ app.post("/api/webhookmangofy", async (req, res) => {
       console.log("[UTMIFY] Pedido ignorado (sem valor).");
     }
 
-    // atualiza status em memória
+    // atualiza status em memória (indexado por payment_code e por event_id)
     if (body.payment_code) {
       const prev = paymentStatus[body.payment_code] || {};
-      paymentStatus[body.payment_code] = {
+      const eventIdFromMetadata =
+        metadata.event_id ||
+        (metadata.metadata && metadata.metadata.event_id) ||
+        prev.event_id;
+
+      const updated = {
         ...prev,
         status: body.payment_status || prev.status || "unknown",
-        amount: body.payment_amount || prev.amount,
+        amount: body.payment_amount || body.sale_amount || prev.amount,
         utms:
-          (body.metadata && body.metadata.utms) ||
-          body.metadata ||
-          prev.utms
+          (metadata && metadata.utms) ||
+          metadata ||
+          prev.utms,
+        payment_code: body.payment_code,
+        event_id: eventIdFromMetadata
       };
+
+      paymentStatus[body.payment_code] = updated;
+      if (eventIdFromMetadata) {
+        paymentStatus[eventIdFromMetadata] = updated;
+      }
     }
 
     // 🔔 TIKTOK & FACEBOOK: Purchase quando pagamento aprovado
@@ -767,7 +794,6 @@ app.post("/api/webhookmangofy", async (req, res) => {
         } else {
           const valueInCents = cents;
 
-          const metadata = body.metadata || {};
           const utmsFromMetadata =
             metadata.utms && typeof metadata.utms === "object"
               ? metadata.utms
