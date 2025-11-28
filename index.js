@@ -41,13 +41,17 @@ const FACEBOOK_GRAPH_API_URL =
   process.env.FACEBOOK_GRAPH_API_URL ||
   "https://graph.facebook.com/v19.0";
 
-// dados fixos do cliente
+// dados fixos do cliente (fallback)
 const FIXED_CUSTOMER = {
   email: "thiagopagamentoss@gmail.com",
   name: "THIAGO MATIAS SOUZA",
   document: "70116952148",
   phone: "31993360332"
 };
+
+// memória simples pra front saber status do pagamento
+// paymentStatus[payment_code] = { status, amount, utms }
+const paymentStatus = {};
 
 app.get("/", (req, res) => {
   res.json({ ok: true, msg: "API da Railway está rodando 🚀" });
@@ -242,8 +246,8 @@ function buildFacebookEventPayload({
     : null;
 
   const user_data = {};
-  if (emailHashed) user_data.em = emailHashed;
-  if (phoneHashed) user_data.ph = phoneHashed;
+  if (emailHashed) user_data.em = [emailHashed]; // array de hashes
+  if (phoneHashed) user_data.ph = [phoneHashed]; // array de hashes
   if (externalIdHashed) user_data.external_id = externalIdHashed;
   if (ip) user_data.client_ip_address = ip;
   if (userAgent) user_data.client_user_agent = userAgent;
@@ -289,9 +293,10 @@ function buildFacebookEventPayload({
     user_data
   };
 
-  if (pageUrl) {
-    event.event_source_url = pageUrl;
-  }
+  // sempre mandar uma URL de origem (usa a do webhook se vier, senão fallback fixo)
+  event.event_source_url =
+    pageUrl || "https://institutomaos.lat/vakinhaoficial/";
+
   if (Object.keys(custom_data).length > 0) {
     event.custom_data = custom_data;
   }
@@ -637,6 +642,15 @@ app.post("/api/pix", async (req, res) => {
     const data = await mgRes.json();
     console.log("[RESPOSTA MANGOFY]", mgRes.status, data);
 
+    // guarda status inicial em memória pra front poder consultar
+    if (data && data.payment_code) {
+      paymentStatus[data.payment_code] = {
+        status: data.payment_status || "pending",
+        amount: valor,
+        utms: allUtms
+      };
+    }
+
     // 🔔 TIKTOK: AddToCart
     try {
       const valueInCents = normalizeCentsInt(valor);
@@ -682,11 +696,30 @@ app.post("/api/pix", async (req, res) => {
       console.error("[FACEBOOK] Erro ao montar evento AddToCart:", err);
     }
 
+    // devolve a resposta da Mangofy pro front (inclui payment_code)
     res.status(mgRes.status).json(data);
   } catch (err) {
     console.error("Erro ao gerar pagamento:", err);
     res.status(500).json({ error: "Erro ao gerar pagamento" });
   }
+});
+
+/**
+ * Endpoint para o front consultar status do pagamento
+ * GET /api/payment-status?payment_code=...
+ */
+app.get("/api/payment-status", (req, res) => {
+  const code = req.query.payment_code;
+  if (!code) {
+    return res.status(400).json({ error: "payment_code é obrigatório" });
+  }
+
+  const info = paymentStatus[code];
+  if (!info) {
+    return res.json({ status: "unknown" });
+  }
+
+  res.json(info);
 });
 
 /**
@@ -707,74 +740,97 @@ app.post("/api/webhookmangofy", async (req, res) => {
       console.log("[UTMIFY] Pedido ignorado (sem valor).");
     }
 
+    // atualiza status em memória
+    if (body.payment_code) {
+      const prev = paymentStatus[body.payment_code] || {};
+      paymentStatus[body.payment_code] = {
+        ...prev,
+        status: body.payment_status || prev.status || "unknown",
+        amount: body.payment_amount || prev.amount,
+        utms:
+          (body.metadata && body.metadata.utms) ||
+          body.metadata ||
+          prev.utms
+      };
+    }
+
     // 🔔 TIKTOK & FACEBOOK: Purchase quando pagamento aprovado
     try {
       if (body.payment_status === "approved") {
-        const valueInCents = toCents(body.payment_amount) || 0;
+        // só manda se tiver valor
+        const cents = toCents(body.payment_amount || body.sale_amount);
+        if (!cents) {
+          console.warn(
+            "[PIXEL] Webhook approved sem payment_amount/sale_amount. Ignorando Purchase. payment_code:",
+            body.payment_code
+          );
+        } else {
+          const valueInCents = cents;
 
-        const metadata = body.metadata || {};
-        const utmsFromMetadata =
-          metadata.utms && typeof metadata.utms === "object"
-            ? metadata.utms
-            : metadata;
+          const metadata = body.metadata || {};
+          const utmsFromMetadata =
+            metadata.utms && typeof metadata.utms === "object"
+              ? metadata.utms
+              : metadata;
 
-        const customerFromWebhook = body.customer || {};
+          const customerFromWebhook = body.customer || {};
 
-        const eventId =
-          metadata.event_id ||
-          (metadata.metadata && metadata.metadata.event_id) ||
-          body.payment_code ||
-          body.external_code ||
-          `pay_${Date.now()}`;
+          const eventId =
+            metadata.event_id ||
+            (metadata.metadata && metadata.metadata.event_id) ||
+            body.payment_code ||
+            body.external_code ||
+            `pay_${Date.now()}`;
 
-        const ip = extractClientIp(metadata.ip || "");
-        const userAgent = metadata.user_agent || "";
-        const pageUrl = metadata.page_url || null;
+          const ip = extractClientIp(metadata.ip || "");
+          const userAgent = metadata.user_agent || "";
+          const pageUrl = metadata.page_url || null;
 
-        // TikTok Purchase
-        const tikTokPayload = buildTikTokEventPayload({
-          eventName: "Purchase",
-          eventId,
-          valueInCents,
-          currency: "BRL",
-          utms: utmsFromMetadata,
-          ip,
-          userAgent,
-          customer: {
-            email: customerFromWebhook.email || FIXED_CUSTOMER.email,
-            phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
-            document:
-              customerFromWebhook.document || FIXED_CUSTOMER.document
-          },
-          pageUrl: null,
-          referrer: null
-        });
+          // TikTok Purchase
+          const tikTokPayload = buildTikTokEventPayload({
+            eventName: "Purchase",
+            eventId,
+            valueInCents,
+            currency: "BRL",
+            utms: utmsFromMetadata,
+            ip,
+            userAgent,
+            customer: {
+              email: customerFromWebhook.email || FIXED_CUSTOMER.email,
+              phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
+              document:
+                customerFromWebhook.document || FIXED_CUSTOMER.document
+            },
+            pageUrl: null,
+            referrer: null
+          });
 
-        sendTikTokEvent(tikTokPayload).catch((err) => {
-          console.error("[TIKTOK] Erro async Purchase:", err);
-        });
+          sendTikTokEvent(tikTokPayload).catch((err) => {
+            console.error("[TIKTOK] Erro async Purchase:", err);
+          });
 
-        // Facebook Purchase
-        const fbPayload = buildFacebookEventPayload({
-          eventName: "Purchase",
-          eventId,
-          valueInCents,
-          currency: "BRL",
-          utms: utmsFromMetadata,
-          ip,
-          userAgent,
-          customer: {
-            email: customerFromWebhook.email || FIXED_CUSTOMER.email,
-            phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
-            document:
-              customerFromWebhook.document || FIXED_CUSTOMER.document
-          },
-          pageUrl
-        });
+          // Facebook Purchase
+          const fbPayload = buildFacebookEventPayload({
+            eventName: "Purchase",
+            eventId,
+            valueInCents,
+            currency: "BRL",
+            utms: utmsFromMetadata,
+            ip,
+            userAgent,
+            customer: {
+              email: customerFromWebhook.email || FIXED_CUSTOMER.email,
+              phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
+              document:
+                customerFromWebhook.document || FIXED_CUSTOMER.document
+            },
+            pageUrl
+          });
 
-        sendFacebookEvent(fbPayload).catch((err) => {
-          console.error("[FACEBOOK] Erro async Purchase:", err);
-        });
+          sendFacebookEvent(fbPayload).catch((err) => {
+            console.error("[FACEBOOK] Erro async Purchase:", err);
+          });
+        }
       }
     } catch (err) {
       console.error("[PIXEL] Erro ao montar/enviar Purchase:", err);
