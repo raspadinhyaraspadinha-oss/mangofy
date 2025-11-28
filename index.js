@@ -15,7 +15,6 @@ const AUTH_HEADER = process.env.MANGOFY_AUTHORIZATION;
 const STORE_CODE_BODY = process.env.MANGOFY_STORE_CODE_BODY;
 
 // URL de postback da Mangofy -> SEU BACKEND
-// use env se quiser, senão usa direto a URL pública da Railway
 const POSTBACK_URL =
   process.env.POSTBACK_URL ||
   "https://nodejs-production-8418.up.railway.app/api/webhookmangofy";
@@ -32,6 +31,15 @@ const TIKTOK_PIXEL_CODE =
   process.env.TIKTOK_PIXEL_CODE || "D31JEHRC77U7TGIRBPQ0";
 const TIKTOK_ACCESS_TOKEN = process.env.TIKTOK_ACCESS_TOKEN;
 const TIKTOK_TEST_EVENT_CODE = process.env.TIKTOK_TEST_EVENT_CODE || null;
+
+// 🔥 Facebook Conversions API
+const FACEBOOK_PIXEL_ID = process.env.FACEBOOK_PIXEL_ID;
+const FACEBOOK_ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN;
+const FACEBOOK_TEST_EVENT_CODE =
+  process.env.FACEBOOK_TEST_EVENT_CODE || null;
+const FACEBOOK_GRAPH_API_URL =
+  process.env.FACEBOOK_GRAPH_API_URL ||
+  "https://graph.facebook.com/v19.0";
 
 // dados fixos do cliente
 const FIXED_CUSTOMER = {
@@ -81,7 +89,7 @@ function nowUtcString() {
 }
 
 /**
- * SHA256 helper (TikTok recomenda dados de usuário hasheados)
+ * SHA256 helper
  */
 function sha256Lower(value) {
   if (!value) return null;
@@ -89,6 +97,21 @@ function sha256Lower(value) {
     .createHash("sha256")
     .update(String(value).trim().toLowerCase())
     .digest("hex");
+}
+
+/**
+ * Normaliza telefone para formato E.164 BR (ex.: 5531999999999)
+ */
+function normalizePhoneE164BR(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/\D/g, "");
+  if (!digits) return null;
+  if (!digits.startsWith("55")) {
+    if (digits.length <= 11) {
+      return "55" + digits;
+    }
+  }
+  return digits;
 }
 
 /**
@@ -125,7 +148,7 @@ function buildTikTokEventPayload({
   const ts =
     typeof eventTime === "number"
       ? eventTime
-      : Math.floor(Date.now() / 1000); // event_time em segundos
+      : Math.floor(Date.now() / 1000);
 
   const hashedEmail = customer.email ? sha256Lower(customer.email) : null;
   const hashedPhone = customer.phone ? sha256Lower(customer.phone) : null;
@@ -138,14 +161,12 @@ function buildTikTokEventPayload({
   if (hashedEmail) user.email = hashedEmail;
   if (hashedPhone) user.phone = hashedPhone;
 
-  // ttclid deve ir em user.ttclid no Events 2.0
   if (utms.ttclid || utms.ttc_id || utms.tt_clickid) {
     user.ttclid = String(
       utms.ttclid || utms.ttc_id || utms.tt_clickid
     );
   }
 
-  // monta properties com utms + valor
   const utmProps = {};
   ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"].forEach(
     (k) => {
@@ -160,8 +181,8 @@ function buildTikTokEventPayload({
   };
 
   if (value != null) {
-    properties.value = value;       // ex.: 20
-    properties.currency = currency; // "BRL"
+    properties.value = value;
+    properties.currency = currency;
     properties.content_type = "product";
     if (eventId) {
       properties.content_id = eventId;
@@ -189,7 +210,105 @@ function buildTikTokEventPayload({
 }
 
 /**
- * Envia evento pro TikTok Events API (server-side)
+ * Monta payload para Facebook Conversions API
+ */
+function buildFacebookEventPayload({
+  eventName,
+  eventId,
+  valueInCents,
+  currency = "BRL",
+  utms = {},
+  ip,
+  userAgent,
+  customer = {},
+  pageUrl,
+  eventTime
+}) {
+  const value =
+    typeof valueInCents === "number" && !Number.isNaN(valueInCents)
+      ? valueInCents / 100
+      : null;
+
+  const ts =
+    typeof eventTime === "number"
+      ? eventTime
+      : Math.floor(Date.now() / 1000);
+
+  const emailHashed = customer.email ? sha256Lower(customer.email) : null;
+  const phoneNorm = normalizePhoneE164BR(customer.phone);
+  const phoneHashed = phoneNorm ? sha256Lower(phoneNorm) : null;
+  const externalIdHashed = customer.document
+    ? sha256Lower(String(customer.document))
+    : null;
+
+  const user_data = {};
+  if (emailHashed) user_data.em = emailHashed;
+  if (phoneHashed) user_data.ph = phoneHashed;
+  if (externalIdHashed) user_data.external_id = externalIdHashed;
+  if (ip) user_data.client_ip_address = ip;
+  if (userAgent) user_data.client_user_agent = userAgent;
+
+  // fbclid / fbp se vierem do front (dentro de utms)
+  if (utms.fbclid) {
+    user_data.fbc = `fb.1.${ts}.${String(utms.fbclid)}`;
+  }
+  if (utms.fbp) {
+    user_data.fbp = String(utms.fbp);
+  }
+
+  const custom_data = {};
+  if (value != null) {
+    custom_data.value = value;
+    custom_data.currency = currency;
+    custom_data.content_type = "product";
+    if (eventId) {
+      custom_data.content_ids = [eventId];
+      custom_data.contents = [
+        {
+          id: eventId,
+          quantity: 1,
+          item_price: value
+        }
+      ];
+    }
+  }
+
+  ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"].forEach(
+    (k) => {
+      if (utms && utms[k]) {
+        custom_data[k] = String(utms[k]);
+      }
+    }
+  );
+
+  const event = {
+    event_name: eventName,
+    event_time: ts,
+    event_id: eventId || undefined,
+    action_source: "website",
+    user_data
+  };
+
+  if (pageUrl) {
+    event.event_source_url = pageUrl;
+  }
+  if (Object.keys(custom_data).length > 0) {
+    event.custom_data = custom_data;
+  }
+
+  const payload = {
+    data: [event]
+  };
+
+  if (FACEBOOK_TEST_EVENT_CODE) {
+    payload.test_event_code = FACEBOOK_TEST_EVENT_CODE;
+  }
+
+  return payload;
+}
+
+/**
+ * Envia evento pro TikTok Events API
  */
 async function sendTikTokEvent(payload) {
   if (!TIKTOK_PIXEL_CODE || !TIKTOK_ACCESS_TOKEN) {
@@ -225,6 +344,53 @@ async function sendTikTokEvent(payload) {
     console.log("[TIKTOK RESPOSTA]", evtName, res.status, text.slice(0, 500));
   } catch (err) {
     console.error("Erro ao enviar evento para TikTok:", err);
+  }
+}
+
+/**
+ * Envia evento para Facebook Conversions API
+ */
+async function sendFacebookEvent(payload) {
+  if (!FACEBOOK_PIXEL_ID || !FACEBOOK_ACCESS_TOKEN) {
+    console.warn(
+      "[FACEBOOK] Pixel ID ou Access Token não configurados. Evento não enviado."
+    );
+    return;
+  }
+
+  try {
+    console.log("[FACEBOOK ENVIANDO]", JSON.stringify(payload, null, 2));
+
+    const url = `${FACEBOOK_GRAPH_API_URL}/${FACEBOOK_PIXEL_ID}/events?access_token=${FACEBOOK_ACCESS_TOKEN}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await res.text();
+
+    let evtName = "unknown";
+    if (
+      payload &&
+      payload.data &&
+      payload.data[0] &&
+      payload.data[0].event_name
+    ) {
+      evtName = payload.data[0].event_name;
+    }
+
+    console.log(
+      "[FACEBOOK RESPOSTA]",
+      evtName,
+      res.status,
+      text.slice(0, 500)
+    );
+  } catch (err) {
+    console.error("Erro ao enviar evento para Facebook:", err);
   }
 }
 
@@ -269,9 +435,24 @@ function buildUtmifyOrderFromWebhook(body) {
   const saleAmountCents = toCents(body.sale_amount);
   const commissionAmountCents = toCents(body.commission_amount);
 
-  const totalPriceInCents = saleAmountCents || paymentAmountCents || 0;
+  const totalPriceInCents =
+    typeof saleAmountCents === "number" && !Number.isNaN(saleAmountCents)
+      ? saleAmountCents
+      : typeof paymentAmountCents === "number" &&
+        !Number.isNaN(paymentAmountCents)
+      ? paymentAmountCents
+      : null;
+
+  if (!totalPriceInCents) {
+    console.warn(
+      "[UTMIFY] Webhook sem payment_amount/sale_amount. Ignorando envio. payment_code:",
+      body.payment_code
+    );
+    return null;
+  }
+
   const gatewayFeeInCents =
-    totalPriceInCents && commissionAmountCents != null
+    commissionAmountCents != null && !Number.isNaN(commissionAmountCents)
       ? totalPriceInCents - commissionAmountCents
       : 0;
 
@@ -286,7 +467,7 @@ function buildUtmifyOrderFromWebhook(body) {
           planId: p.plan_id || null,
           planName: p.plan_name || null,
           quantity: p.quantity || 1,
-          priceInCents: paymentAmountCents
+          priceInCents: totalPriceInCents
         }))
       : [
           {
@@ -295,7 +476,7 @@ function buildUtmifyOrderFromWebhook(body) {
             planId: null,
             planName: null,
             quantity: 1,
-            priceInCents: paymentAmountCents
+            priceInCents: totalPriceInCents
           }
         ];
 
@@ -381,7 +562,7 @@ app.post("/api/pix", async (req, res) => {
     const eventIdFromFront = req.body.event_id;
     const eventId = eventIdFromFront || externalCode;
 
-    // 🔗 junta tudo que é UTM / IDs em um objeto só
+    // junta tudo que é UTM / IDs em um objeto só
     const allUtms = {
       ...utmsRaw,
       ...metadataUtms
@@ -412,13 +593,14 @@ app.post("/api/pix", async (req, res) => {
         phone: FIXED_CUSTOMER.phone,
         ip
       },
-      // ⬇️ AQUI: grava ttclid e demais UTMs direto em metadata
+      // grava ttclid, fbclid, utms e page_url direto na metadata
       metadata: {
-        ...metadataUtms,    // utm_source/medium/campaign/content/term
-        ...utmsRaw,         // ttclid, fbclid, etc (flatten)
-        utms: allUtms,      // cópia agrupada (caso a Mangofy preserve objeto)
+        ...metadataUtms,
+        ...utmsRaw,
+        utms: allUtms,
         ip,
         user_agent: userAgent,
+        page_url: pageUrl,
         event_id: eventId
       },
       extra: {
@@ -433,6 +615,7 @@ app.post("/api/pix", async (req, res) => {
           utms: allUtms,
           ip,
           user_agent: userAgent,
+          page_url: pageUrl,
           event_id: eventId
         }
       }
@@ -454,7 +637,7 @@ app.post("/api/pix", async (req, res) => {
     const data = await mgRes.json();
     console.log("[RESPOSTA MANGOFY]", mgRes.status, data);
 
-    // 🔔 TIKTOK: AddToCart quando o QRCode/PIX é gerado
+    // 🔔 TIKTOK: AddToCart
     try {
       const valueInCents = normalizeCentsInt(valor);
       const tikTokPayload = buildTikTokEventPayload({
@@ -477,6 +660,28 @@ app.post("/api/pix", async (req, res) => {
       console.error("[TIKTOK] Erro ao montar evento AddToCart:", err);
     }
 
+    // 🔔 FACEBOOK: AddToCart
+    try {
+      const valueInCents = normalizeCentsInt(valor);
+      const fbPayload = buildFacebookEventPayload({
+        eventName: "AddToCart",
+        eventId,
+        valueInCents,
+        currency: "BRL",
+        utms: allUtms,
+        ip,
+        userAgent,
+        customer: FIXED_CUSTOMER,
+        pageUrl
+      });
+
+      sendFacebookEvent(fbPayload).catch((err) => {
+        console.error("[FACEBOOK] Erro async AddToCart:", err);
+      });
+    } catch (err) {
+      console.error("[FACEBOOK] Erro ao montar evento AddToCart:", err);
+    }
+
     res.status(mgRes.status).json(data);
   } catch (err) {
     console.error("Erro ao gerar pagamento:", err);
@@ -494,18 +699,20 @@ app.post("/api/webhookmangofy", async (req, res) => {
 
     const utmifyOrder = buildUtmifyOrderFromWebhook(body);
 
-    sendToUtmify(utmifyOrder).catch((err) => {
-      console.error("Erro no envio assíncrono para UTMify:", err);
-    });
+    if (utmifyOrder) {
+      sendToUtmify(utmifyOrder).catch((err) => {
+        console.error("Erro no envio assíncrono para UTMify:", err);
+      });
+    } else {
+      console.log("[UTMIFY] Pedido ignorado (sem valor).");
+    }
 
-    // 🔔 TIKTOK: Purchase quando pagamento aprovado
+    // 🔔 TIKTOK & FACEBOOK: Purchase quando pagamento aprovado
     try {
       if (body.payment_status === "approved") {
         const valueInCents = toCents(body.payment_amount) || 0;
 
         const metadata = body.metadata || {};
-        // se a Mangofy devolver metadata.utms (objeto), usa ele;
-        // senão, usa o próprio metadata (que agora já tem ttclid flatten)
         const utmsFromMetadata =
           metadata.utms && typeof metadata.utms === "object"
             ? metadata.utms
@@ -520,14 +727,19 @@ app.post("/api/webhookmangofy", async (req, res) => {
           body.external_code ||
           `pay_${Date.now()}`;
 
+        const ip = extractClientIp(metadata.ip || "");
+        const userAgent = metadata.user_agent || "";
+        const pageUrl = metadata.page_url || null;
+
+        // TikTok Purchase
         const tikTokPayload = buildTikTokEventPayload({
           eventName: "Purchase",
           eventId,
           valueInCents,
           currency: "BRL",
-          utms: utmsFromMetadata, // ⬅️ agora deve conter ttclid
-          ip: extractClientIp(metadata.ip || ""),
-          userAgent: metadata.user_agent || "",
+          utms: utmsFromMetadata,
+          ip,
+          userAgent,
           customer: {
             email: customerFromWebhook.email || FIXED_CUSTOMER.email,
             phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
@@ -541,9 +753,31 @@ app.post("/api/webhookmangofy", async (req, res) => {
         sendTikTokEvent(tikTokPayload).catch((err) => {
           console.error("[TIKTOK] Erro async Purchase:", err);
         });
+
+        // Facebook Purchase
+        const fbPayload = buildFacebookEventPayload({
+          eventName: "Purchase",
+          eventId,
+          valueInCents,
+          currency: "BRL",
+          utms: utmsFromMetadata,
+          ip,
+          userAgent,
+          customer: {
+            email: customerFromWebhook.email || FIXED_CUSTOMER.email,
+            phone: customerFromWebhook.phone || FIXED_CUSTOMER.phone,
+            document:
+              customerFromWebhook.document || FIXED_CUSTOMER.document
+          },
+          pageUrl
+        });
+
+        sendFacebookEvent(fbPayload).catch((err) => {
+          console.error("[FACEBOOK] Erro async Purchase:", err);
+        });
       }
     } catch (err) {
-      console.error("[TIKTOK] Erro ao montar/enviar Purchase:", err);
+      console.error("[PIXEL] Erro ao montar/enviar Purchase:", err);
     }
 
     res.status(200).json({ received: true });
