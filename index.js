@@ -296,7 +296,7 @@ function buildFacebookEventPayload({
 
   // sempre mandar uma URL de origem (usa a do webhook se vier, senão fallback fixo)
   event.event_source_url =
-    pageUrl || "https://institutomaos.lat/vakinhaoficial/";
+    pageUrl || "https://vakinhainstituto.site/";
 
   if (Object.keys(custom_data).length > 0) {
     event.custom_data = custom_data;
